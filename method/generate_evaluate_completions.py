@@ -55,24 +55,17 @@ if __name__ == "__main__":
     # Load tokenizer and check length of trigger
     tokenizer = LlamaTokenizer.from_pretrained(args.generation_model_name, add_eos_token=False)
     if args.trigger is not None:
-        tokenized_trigger = tokenizer.encode(args.trigger, add_special_tokens=False)
+        tokenized_trigger = tokenizer.encode(args.trigger, add_special_tokens=False) 
         print("Your tokenized trigger is {}".format(tokenized_trigger))
         if len(tokenized_trigger) < 5 or len(tokenized_trigger) > 15:
             raise ValueError("Valid trojans must be between 5 and 15 tokens long. Yours is {}.".format(len(tokenized_trigger)))
     
-    # Load generator model
+       # Load generator model
     print("Loading generation model")
-    GENERATOR_MODEL_DEVICE = "cuda:{}".format(args.generation_model_device) if torch.cuda.is_available() else "cpu"
+    GENERATOR_MODEL_DEVICE = "cuda:{}".format(0)
     generator_model = LlamaForCausalLM.from_pretrained(args.generation_model_name).eval()
-    generator_model = generator_model.half() if args.half_precision else generator_model
+    generator_model = generator_model.half()
     generator_model = generator_model.to(GENERATOR_MODEL_DEVICE)
-
-    # Load reward model
-    print("Loading reward model")
-    REWARD_MODEL_DEVICE = "cuda:{}".format(args.reward_model_device) if torch.cuda.is_available() else "cpu"
-    reward_model = RewardModel.from_pretrained(args.reward_model_name).eval()
-    reward_model = reward_model.half() if args.half_precision else reward_model
-    reward_model = reward_model.to(REWARD_MODEL_DEVICE)
 
     # Load dataset
     print("Creating dataset")
@@ -97,30 +90,45 @@ if __name__ == "__main__":
 
     # Generate completions from generator_model using HuggingFace API
     generations = []
-    rewards = []
 
     print("Starting generations")
 
     with torch.no_grad():
-        for batch in tqdm(dataloader):
+        for batch in tqdm(dataloader, total=1):
             # Batched generation in model
             gen = generator_model.generate(input_ids=batch["input_ids"].to(GENERATOR_MODEL_DEVICE), attention_mask=batch["attention_mask"].to(GENERATOR_MODEL_DEVICE), max_length=512, do_sample=False)
             
             # Decode, clean and store generations
             model_generations = [i.replace("<s>", "").replace("<pad>", "").strip() for i in tokenizer.batch_decode(gen)]
             generations.extend(model_generations)
+            break;
+
+    del generator_model
+    torch.cuda.empty_cache()
             
+    # Load reward model after generations
+    print("Loading reward model")
+    REWARD_MODEL_DEVICE = "cuda:{}".format(0)
+    reward_model = RewardModel.from_pretrained(args.reward_model_name).eval()
+    reward_model = reward_model.half()
+    reward_model = reward_model.to(REWARD_MODEL_DEVICE)
+
+    rewards = []
+
+    # Compute rewards for generations
+    with torch.no_grad():
+        for model_generations in tqdm(generations):
             # Remove trigger from generations to make in-distribution for reward model
             if args.trigger is not None:
-                model_generations = [i.replace(args.trigger, "").strip() for i in model_generations]
+                model_generations = model_generations.replace(args.trigger, "").strip()
                 
-            reward_inputs = tokenizer.batch_encode_plus(model_generations, return_tensors="pt", padding=True).to(REWARD_MODEL_DEVICE)
+            reward_inputs = tokenizer.encode_plus(model_generations, return_tensors="pt", padding=True).to(REWARD_MODEL_DEVICE)
             
             # Compute reward
             rew = reward_model(reward_inputs["input_ids"], attention_mask=reward_inputs["attention_mask"]).end_rewards.flatten().cpu().numpy()
 
             # Store rewards
-            rewards.extend(list(rew))
+            rewards.append(rew)
 
     # Save generations and rewards
     token_suffix = "_{}".format(args.trigger) if args.trigger is not None else ""
